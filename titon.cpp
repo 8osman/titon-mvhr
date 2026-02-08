@@ -1,880 +1,656 @@
-// =======================================
-// Titon DIGIT SE COMMUNICATION PROTOCOL
-// =======================================
+// Titon MVHR - Complete Control with MAX485 Module
+// Board: ESP32 Dev Module (or Lolin32 Lite)
+// RS485: MAX485 module with DE/RE control
 
-#include "Titon.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-// tn fan speed (1-8) conversion table
-const uint8_t tnFanSpeeds[] = {
-  tn_FAN_SPEED_1,
-  tn_FAN_SPEED_2,
-  tn_FAN_SPEED_3,
-  tn_FAN_SPEED_4,
-  tn_FAN_SPEED_5,
-  tn_FAN_SPEED_6,
-  tn_FAN_SPEED_7,
-  tn_FAN_SPEED_8
-};
+// ========== CONFIGURATION ==========
+const char* WIFI_SSID = "YourWiFiName";
+const char* WIFI_PASSWORD = "YourWiFiPassword";
+const char* MQTT_SERVER = "192.168.0.xxx";
+const int MQTT_PORT = 1883;
+const char* MQTT_USER = "mqtt_user";
+const char* MQTT_PASSWORD = "mqtt_pass";
+const char* MQTT_CLIENT_ID = "titon_mvhr";
 
-// tn NTC temperature conversion table
-const int8_t tnTemps[] = {
-  -74, -70, -66, -62, -59, -56, -54, -52, -50, -48, // 0x00 - 0x09
-  -47, -46, -44, -43, -42, -41, -40, -39, -38, -37, // 0x0a - 0x13
-  -36, -35, -34, -33, -33, -32, -31, -30, -30, -29, // 0x14 - 0x1d
-  -28, -28, -27, -27, -26, -25, -25, -24, -24, -23, // 0x1e - 0x27
-  -23, -22, -22, -21, -21, -20, -20, -19, -19, -19, // 0x28 - 0x31
-  -18, -18, -17, -17, -16, -16, -16, -15, -15, -14, // 0x32 - 0x3b
-  -14, -14, -13, -13, -12, -12, -12, -11, -11, -11, // 0x3c - 0x45
-  -10, -10, -9, -9, -9, -8, -8, -8, -7, -7,         // 0x46 - 0x4f
-  -7, -6, -6, -6, -5, -5, -5, -4, -4, -4,           // 0x50 - 0x59
-  -3, -3, -3, -2, -2, -2, -1, -1, -1, -1,           // 0x5a - 0x63
-  0,  0,  0,  1,  1,  1,  2,  2,  2,  3,            // 0x64 - 0x6d
-  3,  3,  4,  4,  4,  5,  5,  5,  5,  6,            // 0x6e - 0x77
-  6,  6,  7,  7,  7,  8,  8,  8,  9,  9,            // 0x78 - 0x81
-  9, 10, 10, 10, 11, 11, 11, 12, 12, 12,            // 0x82 - 0x8b
-  13, 13, 13, 14, 14, 14, 15, 15, 15, 16,           // 0x8c - 0x95
-  16, 16, 17, 17, 18, 18, 18, 19, 19, 19,           // 0x96 - 0x9f
-  20, 20, 21, 21, 21, 22, 22, 22, 23, 23,           // 0xa0 - 0xa9
-  24, 24, 24, 25, 25, 26, 26, 27, 27, 27,           // 0xaa - 0xb3
-  28, 28, 29, 29, 30, 30, 31, 31, 32, 32,           // 0xb4 - 0xbd
-  33, 33, 34, 34, 35, 35, 36, 36, 37, 37,           // 0xbe - 0xc7
-  38, 38, 39, 40, 40, 41, 41, 42, 43, 43,           // 0xc8 - 0xd1
-  44, 45, 45, 46, 47, 48, 48, 49, 50, 51,           // 0xd2 - 0xdb
-  52, 53, 53, 54, 55, 56, 57, 59, 60, 61,           // 0xdc - 0xe5
-  62, 63, 65, 66, 68, 69, 71, 73, 75, 77,           // 0xe6 - 0xef
-  79, 81, 82, 86, 90, 93, 97, 100, 100, 100,        // 0xf0 - 0xf9
-  100, 100, 100, 100, 100, 100                      // 0xfa - 0xff
-};
+// RS485 Settings with MAX485 Module
+const int RS485_RX = 16;      // Connect to RO (Receiver Output) on MAX485
+const int RS485_TX = 17;      // Connect to DI (Driver Input) on MAX485
+const int RS485_DE = 4;       // Connect to DE (Driver Enable) on MAX485
+const int RS485_RE = 4;       // Connect to RE (Receiver Enable) on MAX485 (same pin as DE)
+const int RS485_BAUD = 1200;
 
-// public
+// Relay Control Pins (connected to 3-channel relay module)
+const int RELAY_SW1 = 25;  // SW1: SUMMERboost Disable
+const int RELAY_SW2 = 26;  // SW2: Wet Room Boost
+const int RELAY_SW3 = 27;  // SW3: Speed 1 Setback / Kitchen Boost
 
-Titon::Titon() {
-  Titon(false);
+// Humidity Sensor (0-10V via voltage divider)
+const int HUMIDITY_PIN = 34;  // GPIO34 (ADC1_CH6)
+
+// MQTT Topics
+const char* TOPIC_STATE = "homeassistant/climate/titon_mvhr/state";
+const char* TOPIC_COMMAND = "homeassistant/climate/titon_mvhr/command";
+const char* TOPIC_AVAILABILITY = "homeassistant/climate/titon_mvhr/availability";
+const char* DISCOVERY_PREFIX = "homeassistant";
+
+// ========== GLOBALS ==========
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+// Sensor Data
+float supply_temp = NAN;
+float extract_temp = NAN;
+float supply_rpm = NAN;
+float extract_rpm = NAN;
+float current_humidity = NAN;
+int current_speed = 2;
+bool summer_bypass = false;
+bool summerboost_active = false;
+
+// Relay States (for Home Assistant feedback)
+bool relay_sw1_active = false;
+bool relay_sw2_active = false;
+bool relay_sw3_active = false;
+
+// Configurable Settings
+struct Settings {
+  int speed1_supply = 18;
+  int speed1_extract = 18;
+  int speed2_supply = 40;
+  int speed2_extract = 40;
+  int speed3_supply = 70;
+  int speed3_extract = 70;
+  int speed4_supply = 100;
+  int speed4_extract = 100;
+  int humidity_setpoint = 70;
+  int kitchen_overrun = 10;
+  int wetroom_overrun = 30;
+  int bypass_extract_threshold = 22;
+  int bypass_supply_threshold = 15;
+  bool summerboost_enabled = true;
+} settings;
+
+String rx_buffer = "";
+unsigned long last_mqtt_publish = 0;
+unsigned long last_heartbeat = 0;
+unsigned long last_humidity_read = 0;
+const unsigned long PUBLISH_INTERVAL = 5000;
+const unsigned long HUMIDITY_READ_INTERVAL = 5000;
+
+// ========== FORWARD DECLARATIONS ==========
+void setup_wifi();
+void reconnect_mqtt();
+void mqtt_callback(char* topic, byte* payload, unsigned int length);
+void publish_discovery();
+void publish_state();
+void parse_response(String response);
+void set_fan_speed(int speed);
+void trigger_boost(int switch_num, unsigned long duration_ms);
+void set_relay(int relay_pin, bool state);
+float read_humidity();
+void rs485_begin_transmit();
+void rs485_begin_receive();
+void send_rs485_command(const char* cmd);
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n========================================");
+  Serial.println("Titon MVHR - Complete Control System");
+  Serial.println("With MAX485 Module");
+  Serial.println("========================================");
+  
+  // Initialize RS485 with MAX485 control
+  Serial2.begin(RS485_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
+  pinMode(RS485_DE, OUTPUT);
+  pinMode(RS485_RE, OUTPUT);
+  rs485_begin_receive();  // Start in receive mode
+  Serial.println("RS485 initialized at 1200 baud with MAX485");
+  
+  // Initialize relay pins
+  pinMode(RELAY_SW1, OUTPUT);
+  pinMode(RELAY_SW2, OUTPUT);
+  pinMode(RELAY_SW3, OUTPUT);
+  digitalWrite(RELAY_SW1, LOW);
+  digitalWrite(RELAY_SW2, LOW);
+  digitalWrite(RELAY_SW3, LOW);
+  Serial.println("Relay outputs initialized");
+  
+  // Initialize humidity sensor ADC
+  pinMode(HUMIDITY_PIN, INPUT);
+  analogSetAttenuation(ADC_11db);  // 0-3.3V range
+  Serial.println("Humidity sensor ADC initialized");
+  
+  setup_wifi();
+  
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqtt_callback);
+  mqtt.setBufferSize(1024);
+  
+  delay(1000);
+  publish_discovery();
+  
+  Serial.println("Setup complete!");
+  Serial.println("========================================");
 }
 
-Titon::Titon(boolean debug) {
-  isDebug = debug;
+// ========== MAX485 CONTROL FUNCTIONS ==========
+void rs485_begin_transmit() {
+  digitalWrite(RS485_DE, HIGH);  // Enable driver
+  digitalWrite(RS485_RE, HIGH);  // Disable receiver
+  delayMicroseconds(10);         // Small delay for switching
 }
 
-bool Titon::connect(HardwareSerial *s) {
-  serial = s;
-  serial->begin(9600, SERIAL_8N1);
-
-  fullInitDone = false;
-
-  requestConfig();
-
-  return true;
+void rs485_begin_receive() {
+  delayMicroseconds(10);         // Wait for transmission to complete
+  digitalWrite(RS485_DE, LOW);   // Disable driver
+  digitalWrite(RS485_RE, LOW);   // Enable receiver
 }
 
-void Titon::requestConfig() {
-  sendStatusReq();
-  sendIO08Req();
-  sendFanSpeedReq();
-  sendDefaultFanSpeedReq();
-  sendRhReq();
-  sendServicePeriodReq();
-  sendServiceCounterReq();
-  sendHeatingTargetReq();
-
-  sendFlags06Req();
-  sendProgramReq();
-
-  // Temperature values are not needed to request, they are updated automatically
-  // RH values are not needed to request, they are updated automatically
-
-  // Set request time for all configurations
-  unsigned long now = millis();
-  data.updated = millis();
-  lastRequested = now;
+void send_rs485_command(const char* cmd) {
+  rs485_begin_transmit();
+  Serial2.print(cmd);
+  Serial2.flush();  // Wait for transmission to complete
+  rs485_begin_receive();
+  Serial.printf("RS485 TX: %s", cmd);
 }
 
-void Titon::loop() {
-  byte message[tn_MSG_LENGTH];
-
-  // read and decode as long as messages are available
-  while (readMessage(message)) {
-    // Inform with callback about message
-    decodeMessage(message);
+// ========== WIFI ==========
+void setup_wifi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
   }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(" FAILED!");
+  }
+}
 
-  // query for data that can change without notice
-  unsigned long now = millis();
-  if (now - lastRequested > QUERY_INTERVAL) {
-    lastRequested = now;
+// ========== MQTT RECONNECT ==========
+void reconnect_mqtt() {
+  if (mqtt.connected()) return;
+  
+  Serial.print("Connecting to MQTT...");
+  
+  if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
+                   TOPIC_AVAILABILITY, 0, true, "offline")) {
+    Serial.println(" connected!");
+    mqtt.publish(TOPIC_AVAILABILITY, "online", true);
+    mqtt.subscribe(TOPIC_COMMAND);
+  } else {
+    Serial.print(" failed, rc=");
+    Serial.println(mqtt.state());
+  }
+}
 
-    if (isStatusInitDone()) {
-      sendIO08Req();
-      sendServiceCounterReq();
+// ========== MQTT CALLBACK ==========
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("MQTT RX: ");
+  Serial.println(message);
+  
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, message)) {
+    Serial.println("JSON parse failed");
+    return;
+  }
+  
+  // Fan speed control (via RS485)
+  if (doc.containsKey("fan_speed")) {
+    set_fan_speed(doc["fan_speed"]);
+  }
+  
+  // Relay switch control
+  if (doc.containsKey("sw1")) {
+    bool state = doc["sw1"];
+    set_relay(RELAY_SW1, state);
+    relay_sw1_active = state;
+    Serial.printf("SW1 (SUMMERboost Disable): %s\n", state ? "ON" : "OFF");
+  }
+  
+  if (doc.containsKey("sw2")) {
+    bool state = doc["sw2"];
+    set_relay(RELAY_SW2, state);
+    relay_sw2_active = state;
+    Serial.printf("SW2 (Wet Room Boost): %s\n", state ? "ON" : "OFF");
+  }
+  
+  if (doc.containsKey("sw3")) {
+    bool state = doc["sw3"];
+    set_relay(RELAY_SW3, state);
+    relay_sw3_active = state;
+    Serial.printf("SW3 (Setback/Kitchen): %s\n", state ? "ON" : "OFF");
+  }
+  
+  // Momentary boost triggers (pulse relay for 2 seconds)
+  if (doc.containsKey("trigger_wetroom_boost")) {
+    Serial.println("Triggering wet room boost (momentary)");
+    trigger_boost(2, 2000);  // SW2 for 2 seconds
+  }
+  
+  if (doc.containsKey("trigger_kitchen_boost")) {
+    Serial.println("Triggering kitchen boost (momentary)");
+    trigger_boost(3, 2000);  // SW3 for 2 seconds
+  }
+  
+  // Settings updates (stored in memory)
+  if (doc.containsKey("speed1_supply")) settings.speed1_supply = doc["speed1_supply"];
+  if (doc.containsKey("speed1_extract")) settings.speed1_extract = doc["speed1_extract"];
+  if (doc.containsKey("speed2_supply")) settings.speed2_supply = doc["speed2_supply"];
+  if (doc.containsKey("speed2_extract")) settings.speed2_extract = doc["speed2_extract"];
+  if (doc.containsKey("speed3_supply")) settings.speed3_supply = doc["speed3_supply"];
+  if (doc.containsKey("speed3_extract")) settings.speed3_extract = doc["speed3_extract"];
+  if (doc.containsKey("speed4_supply")) settings.speed4_supply = doc["speed4_supply"];
+  if (doc.containsKey("speed4_extract")) settings.speed4_extract = doc["speed4_extract"];
+  if (doc.containsKey("humidity_setpoint")) settings.humidity_setpoint = doc["humidity_setpoint"];
+  if (doc.containsKey("kitchen_overrun")) settings.kitchen_overrun = doc["kitchen_overrun"];
+  if (doc.containsKey("wetroom_overrun")) settings.wetroom_overrun = doc["wetroom_overrun"];
+  if (doc.containsKey("bypass_extract_threshold")) settings.bypass_extract_threshold = doc["bypass_extract_threshold"];
+  if (doc.containsKey("bypass_supply_threshold")) settings.bypass_supply_threshold = doc["bypass_supply_threshold"];
+  if (doc.containsKey("summerboost_enabled")) settings.summerboost_enabled = doc["summerboost_enabled"];
+}
+
+// ========== HOME ASSISTANT DISCOVERY ==========
+void publish_discovery() {
+  Serial.println("Publishing Home Assistant discovery...");
+  
+  // Climate entity
+  {
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/climate/titon_mvhr/config", DISCOVERY_PREFIX);
+    
+    StaticJsonDocument<768> doc;
+    doc["name"] = "Titon MVHR";
+    doc["unique_id"] = "titon_mvhr_climate";
+    doc["mode_command_topic"] = TOPIC_COMMAND;
+    doc["mode_state_topic"] = TOPIC_STATE;
+    doc["mode_state_template"] = "{{ value_json.mode }}";
+    doc["modes"][0] = "off";
+    doc["modes"][1] = "fan_only";
+    
+    doc["fan_mode_command_topic"] = TOPIC_COMMAND;
+    doc["fan_mode_state_topic"] = TOPIC_STATE;
+    doc["fan_mode_state_template"] = "{{ value_json.fan_mode }}";
+    doc["fan_modes"][0] = "low";
+    doc["fan_modes"][1] = "medium";
+    doc["fan_modes"][2] = "high";
+    doc["fan_modes"][3] = "auto";
+    
+    doc["current_temperature_topic"] = TOPIC_STATE;
+    doc["current_temperature_template"] = "{{ value_json.supply_temp }}";
+    doc["temperature_unit"] = "C";
+    doc["availability_topic"] = TOPIC_AVAILABILITY;
+    
+    JsonObject dev = doc.createNestedObject("device");
+    dev["identifiers"][0] = "titon_mvhr";
+    dev["name"] = "Titon MVHR";
+    dev["model"] = "HRV1.6 Q Plus HMB";
+    dev["manufacturer"] = "Titon";
+    
+    char buffer[768];
+    serializeJson(doc, buffer);
+    mqtt.publish(topic, buffer, true);
+    delay(100);
+  }
+  
+  // Sensors macro
+  #define PUBLISH_SENSOR(id, name, unit, dev_class) { \
+    char topic[128]; \
+    snprintf(topic, sizeof(topic), "%s/sensor/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
+    StaticJsonDocument<384> doc; \
+    doc["name"] = name; \
+    doc["unique_id"] = String("titon_mvhr_") + id; \
+    doc["state_topic"] = TOPIC_STATE; \
+    doc["value_template"] = String("{{ value_json.") + id + " }}"; \
+    doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    if (strlen(unit) > 0) doc["unit_of_measurement"] = unit; \
+    if (strlen(dev_class) > 0) doc["device_class"] = dev_class; \
+    JsonObject dev = doc.createNestedObject("device"); \
+    dev["identifiers"][0] = "titon_mvhr"; \
+    char buffer[384]; \
+    serializeJson(doc, buffer); \
+    mqtt.publish(topic, buffer, true); \
+    delay(50); \
+  }
+  
+  PUBLISH_SENSOR("supply_temp", "Supply Temperature", "°C", "temperature");
+  PUBLISH_SENSOR("extract_temp", "Extract Temperature", "°C", "temperature");
+  PUBLISH_SENSOR("supply_rpm", "Supply Fan RPM", "RPM", "");
+  PUBLISH_SENSOR("extract_rpm", "Extract Fan RPM", "RPM", "");
+  PUBLISH_SENSOR("current_speed", "Current Speed", "", "");
+  PUBLISH_SENSOR("humidity", "Current Humidity", "%", "humidity");
+  
+  // Binary sensors
+  #define PUBLISH_BINARY(id, name) { \
+    char topic[128]; \
+    snprintf(topic, sizeof(topic), "%s/binary_sensor/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
+    StaticJsonDocument<384> doc; \
+    doc["name"] = name; \
+    doc["unique_id"] = String("titon_mvhr_") + id; \
+    doc["state_topic"] = TOPIC_STATE; \
+    doc["value_template"] = String("{{ value_json.") + id + " }}"; \
+    doc["payload_on"] = "true"; \
+    doc["payload_off"] = "false"; \
+    doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    JsonObject dev = doc.createNestedObject("device"); \
+    dev["identifiers"][0] = "titon_mvhr"; \
+    char buffer[384]; \
+    serializeJson(doc, buffer); \
+    mqtt.publish(topic, buffer, true); \
+    delay(50); \
+  }
+  
+  PUBLISH_BINARY("summer_bypass", "Summer Bypass Active");
+  PUBLISH_BINARY("summerboost", "SUMMERboost Active");
+  
+  // Switch entities
+  #define PUBLISH_SWITCH(id, name) { \
+    char topic[128]; \
+    snprintf(topic, sizeof(topic), "%s/switch/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
+    StaticJsonDocument<384> doc; \
+    doc["name"] = name; \
+    doc["unique_id"] = String("titon_mvhr_") + id; \
+    doc["state_topic"] = TOPIC_STATE; \
+    doc["command_topic"] = TOPIC_COMMAND; \
+    doc["value_template"] = String("{{ value_json.") + id + " }}"; \
+    doc["payload_on"] = String("{\"") + id + "\": true}"; \
+    doc["payload_off"] = String("{\"") + id + "\": false}"; \
+    doc["state_on"] = "true"; \
+    doc["state_off"] = "false"; \
+    doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    JsonObject dev = doc.createNestedObject("device"); \
+    dev["identifiers"][0] = "titon_mvhr"; \
+    char buffer[384]; \
+    serializeJson(doc, buffer); \
+    mqtt.publish(topic, buffer, true); \
+    delay(50); \
+  }
+  
+  PUBLISH_SWITCH("sw1", "SUMMERboost Disable (SW1)");
+  PUBLISH_SWITCH("sw2", "Wet Room Boost (SW2)");
+  PUBLISH_SWITCH("sw3", "Setback/Kitchen (SW3)");
+  
+  // Button entities
+  #define PUBLISH_BUTTON(id, name, cmd_key) { \
+    char topic[128]; \
+    snprintf(topic, sizeof(topic), "%s/button/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
+    StaticJsonDocument<384> doc; \
+    doc["name"] = name; \
+    doc["unique_id"] = String("titon_mvhr_") + id; \
+    doc["command_topic"] = TOPIC_COMMAND; \
+    doc["payload_press"] = String("{\"") + cmd_key + "\": true}"; \
+    doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    JsonObject dev = doc.createNestedObject("device"); \
+    dev["identifiers"][0] = "titon_mvhr"; \
+    char buffer[384]; \
+    serializeJson(doc, buffer); \
+    mqtt.publish(topic, buffer, true); \
+    delay(50); \
+  }
+  
+  PUBLISH_BUTTON("trigger_wetroom", "Trigger Wet Room Boost", "trigger_wetroom_boost");
+  PUBLISH_BUTTON("trigger_kitchen", "Trigger Kitchen Boost", "trigger_kitchen_boost");
+  
+  // Number entities
+  #define PUBLISH_NUMBER(id, name, min_v, max_v) { \
+    char topic[128]; \
+    snprintf(topic, sizeof(topic), "%s/number/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
+    StaticJsonDocument<384> doc; \
+    doc["name"] = name; \
+    doc["unique_id"] = String("titon_mvhr_") + id; \
+    doc["state_topic"] = TOPIC_STATE; \
+    doc["command_topic"] = TOPIC_COMMAND; \
+    doc["value_template"] = String("{{ value_json.") + id + " }}"; \
+    doc["command_template"] = String("{\"") + id + "\": {{ value }}}"; \
+    doc["min"] = min_v; \
+    doc["max"] = max_v; \
+    doc["step"] = 1; \
+    doc["mode"] = "slider"; \
+    doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    JsonObject dev = doc.createNestedObject("device"); \
+    dev["identifiers"][0] = "titon_mvhr"; \
+    char buffer[384]; \
+    serializeJson(doc, buffer); \
+    mqtt.publish(topic, buffer, true); \
+    delay(50); \
+  }
+  
+  PUBLISH_NUMBER("speed1_supply", "Speed 1 Supply %", 14, 100);
+  PUBLISH_NUMBER("speed1_extract", "Speed 1 Extract %", 14, 100);
+  PUBLISH_NUMBER("speed2_supply", "Speed 2 Supply %", 14, 100);
+  PUBLISH_NUMBER("speed2_extract", "Speed 2 Extract %", 14, 100);
+  PUBLISH_NUMBER("speed3_supply", "Speed 3 Supply %", 14, 100);
+  PUBLISH_NUMBER("speed3_extract", "Speed 3 Extract %", 14, 100);
+  PUBLISH_NUMBER("speed4_supply", "Speed 4 Supply %", 14, 100);
+  PUBLISH_NUMBER("speed4_extract", "Speed 4 Extract %", 14, 100);
+  PUBLISH_NUMBER("humidity_setpoint", "Humidity Setpoint", 30, 100);
+  PUBLISH_NUMBER("kitchen_overrun", "Kitchen Timer (min)", 0, 60);
+  PUBLISH_NUMBER("wetroom_overrun", "Wet Room Timer (min)", 0, 60);
+  PUBLISH_NUMBER("bypass_extract_threshold", "Bypass Extract °C", 17, 35);
+  PUBLISH_NUMBER("bypass_supply_threshold", "Bypass Supply °C", 10, 20);
+  
+  Serial.println("Discovery complete!");
+}
+
+// ========== PUBLISH STATE ==========
+void publish_state() {
+  if (!mqtt.connected()) return;
+  
+  StaticJsonDocument<1024> doc;
+  
+  // Sensor data
+  doc["supply_temp"] = supply_temp;
+  doc["extract_temp"] = extract_temp;
+  doc["supply_rpm"] = supply_rpm;
+  doc["extract_rpm"] = extract_rpm;
+  doc["current_speed"] = current_speed;
+  doc["humidity"] = current_humidity;
+  doc["summer_bypass"] = summer_bypass;
+  doc["summerboost"] = summerboost_active;
+  
+  // Relay states
+  doc["sw1"] = relay_sw1_active;
+  doc["sw2"] = relay_sw2_active;
+  doc["sw3"] = relay_sw3_active;
+  
+  // Climate entity
+  doc["mode"] = (current_speed > 0) ? "fan_only" : "off";
+  String fan_mode = "medium";
+  if (current_speed == 1) fan_mode = "low";
+  else if (current_speed == 3) fan_mode = "high";
+  else if (current_speed == 4) fan_mode = "auto";
+  doc["fan_mode"] = fan_mode;
+  
+  // Settings
+  doc["speed1_supply"] = settings.speed1_supply;
+  doc["speed1_extract"] = settings.speed1_extract;
+  doc["speed2_supply"] = settings.speed2_supply;
+  doc["speed2_extract"] = settings.speed2_extract;
+  doc["speed3_supply"] = settings.speed3_supply;
+  doc["speed3_extract"] = settings.speed3_extract;
+  doc["speed4_supply"] = settings.speed4_supply;
+  doc["speed4_extract"] = settings.speed4_extract;
+  doc["humidity_setpoint"] = settings.humidity_setpoint;
+  doc["kitchen_overrun"] = settings.kitchen_overrun;
+  doc["wetroom_overrun"] = settings.wetroom_overrun;
+  doc["bypass_extract_threshold"] = settings.bypass_extract_threshold;
+  doc["bypass_supply_threshold"] = settings.bypass_supply_threshold;
+  doc["summerboost_enabled"] = settings.summerboost_enabled;
+  
+  char buffer[1024];
+  serializeJson(doc, buffer);
+  mqtt.publish(TOPIC_STATE, buffer);
+}
+
+// ========== RS485 PARSING ==========
+void parse_response(String response) {
+  int sign_pos = -1;
+  for (unsigned int i = 0; i < response.length(); i++) {
+    if (response[i] == '+' || response[i] == '-') {
+      sign_pos = i;
+      break;
     }
   }
-
-  if (now - lastRetryLoop > RETRY_INTERVAL) {
-    retryLoop();
+  
+  if (sign_pos == -1) return;
+  
+  int address = response.substring(0, sign_pos).toInt();
+  int value = response.substring(sign_pos).toInt();
+  
+  switch (address) {
+    case 380:
+      supply_rpm = value;
+      break;
+    case 381:
+      extract_rpm = value;
+      break;
+    case 382:
+      supply_temp = value / 10.0;
+      break;
+    case 383:
+      extract_temp = value / 10.0;
+      break;
+    case 384:
+      current_speed = value;
+      break;
+    case 385:
+      summer_bypass = (value & 0x01) != 0;
+      summerboost_active = (value & 0x02) != 0;
+      break;
   }
 }
 
-// setters
-// these will set data both in the bus and cache
-void Titon::setFanSpeed(int speed) {
-  if (speed <= tn_MAX_FAN_SPEED) {
-    setVariable(tn_VARIABLE_FAN_SPEED, fanSpeed2Hex(speed));
-    data.fan_speed.value = speed;
-    statusChangedCallback();
+// ========== FAN SPEED CONTROL (RS485) ==========
+void set_fan_speed(int speed) {
+  if (speed < 1 || speed > 4) return;
+  
+  int speed_value = 0;
+  switch (speed) {
+    case 1: speed_value = 1; break;
+    case 2: speed_value = 2; break;
+    case 3: speed_value = 4; break;
+    case 4: speed_value = 8; break;
   }
+  
+  char cmd[16];
+  snprintf(cmd, sizeof(cmd), "3840+%05d\r\n", speed_value);
+  send_rs485_command(cmd);
+  Serial.printf("Set speed to %d\n", speed);
 }
 
-void Titon::setDefaultFanSpeed(int speed) {
-  if (speed < tn_MAX_FAN_SPEED) {
-    setVariable(tn_VARIABLE_DEFAULT_FAN_SPEED, fanSpeed2Hex(speed));
-    data.default_fan_speed.value = speed;
-    statusChangedCallback();
+// ========== RELAY CONTROL ==========
+void set_relay(int relay_pin, bool state) {
+  digitalWrite(relay_pin, state ? HIGH : LOW);
+  Serial.printf("Relay on pin %d: %s\n", relay_pin, state ? "ON" : "OFF");
+}
+
+void trigger_boost(int switch_num, unsigned long duration_ms) {
+  int relay_pin;
+  switch (switch_num) {
+    case 1: relay_pin = RELAY_SW1; break;
+    case 2: relay_pin = RELAY_SW2; break;
+    case 3: relay_pin = RELAY_SW3; break;
+    default: return;
   }
+  
+  Serial.printf("Pulsing SW%d relay for %lu ms\n", switch_num, duration_ms);
+  digitalWrite(relay_pin, HIGH);
+  delay(duration_ms);
+  digitalWrite(relay_pin, LOW);
+  Serial.printf("SW%d pulse complete - PCB will handle overrun timer\n", switch_num);
 }
 
-// Status variables
-void Titon::setOn() {
-
-  if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value | tn_STATUS_FLAG_POWER)) {
-    data.is_on.value = true;
-    statusChangedCallback();
+// ========== HUMIDITY SENSOR ==========
+float read_humidity() {
+  // Read ADC multiple times and average for stability
+  int sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(HUMIDITY_PIN);
+    delay(10);
   }
+  int raw = sum / 5;
+  
+  // Convert to voltage (0-3.3V)
+  float voltage = (raw / 4095.0) * 3.3;
+  
+  // Convert to sensor voltage (0-10V)
+  // Voltage divider: R1=68k, R2=22k
+  float sensor_voltage = voltage * ((68.0 + 22.0) / 22.0);
+  
+  // Convert to humidity percentage (0-100%)
+  float humidity = sensor_voltage * 10.0;
+  
+  // Clamp to valid range
+  if (humidity < 0) humidity = 0;
+  if (humidity > 100) humidity = 100;
+  
+  return humidity;
 }
 
-void Titon::setOff() {
-  if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value & ~tn_STATUS_FLAG_POWER)) {
-    data.is_on.value = false;
-    statusChangedCallback();
+// ========== MAIN LOOP ==========
+void loop() {
+  // WiFi check
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
   }
-}
-
-void Titon::setRhModeOn() {
-  if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value | tn_STATUS_FLAG_RH)) {
-    data.is_rh_mode.value = true;
-    statusChangedCallback();
+  
+  // MQTT check
+  if (!mqtt.connected()) {
+    reconnect_mqtt();
   }
-}
-
-void Titon::setRhModeOff() {
-  if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value & ~tn_STATUS_FLAG_RH)) {
-    data.is_rh_mode.value = false;
-    statusChangedCallback();
+  mqtt.loop();
+  
+  // Heartbeat
+  if (millis() - last_heartbeat > 2000) {
+    Serial.printf("Status - WiFi:%s MQTT:%s Humidity:%.1f%%\n",
+                  WiFi.status() == WL_CONNECTED ? "OK" : "X",
+                  mqtt.connected() ? "OK" : "X",
+                  current_humidity);
+    last_heartbeat = millis();
   }
-}
-
-void Titon::setHeatingModeOn() {
-  // Don't set if already active. Titon seems to reset to default speed if same mode is set twice
-  if (data.status.value & tn_STATUS_FLAG_HEATING_MODE) {
-    debugPrintCallback("Heating mode is already on!");
-    statusChangedCallback();
-  }
-  else if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value | tn_STATUS_FLAG_HEATING_MODE)) {
-    data.is_heating_mode.value = true;
-    statusChangedCallback();
-  }
-}
-
-void Titon::setHeatingModeOff() {
-  // Don't set if already active. Titon seems to reset to default speed if same mode is set twice
-  if (!(data.status.value & tn_STATUS_FLAG_HEATING_MODE)) {
-    debugPrintCallback("Heating mode is already off!");
-    statusChangedCallback();
-  }
-  else if (setStatusVariable(tn_VARIABLE_STATUS, data.status.value & ~tn_STATUS_FLAG_HEATING_MODE)) {
-    data.is_heating_mode.value = false;
-    statusChangedCallback();
-  }
-}
-
-boolean Titon::setStatusVariable(byte variable, byte value) {
-  if (!statusMutex) {
-    statusMutex = true; // lock sending status again
-    // Status is only allowed to send to specific mainboard
-    setVariable(variable, value, tn_MSG_MAINBOARD_1);
-
-    // Clear the retry loop to prevent retry loops to break in before getting reply
-    lastRetryLoop = millis();
-    return true;
-  }
-
-  return false;
-}
-
-void Titon::setServicePeriod(int months) {
-  if (months >= 0 && months < 256) {
-    setVariable(tn_VARIABLE_SERVICE_PERIOD, months);
-    data.service_period.value = months;
-    statusChangedCallback();
-  }
-}
-
-void Titon::setServiceCounter(int months) {
-  if (months >= 0 && months < 256) {
-    setVariable(tn_VARIABLE_SERVICE_COUNTER, months);
-    data.service_counter.value = months;
-    statusChangedCallback();
-  }
-}
-
-void Titon::setHeatingTarget(int cel) {
-  if (cel >= 10 && cel <= 27) {
-    byte hex = cel2Ntc(cel);
-    setVariable(tn_VARIABLE_HEATING_TARGET, hex);
-    data.heating_target.value = cel;
-    statusChangedCallback();
-  }
-}
-
-void Titon::setSwitchOn() {
-  // Activate boost/fireplace
-  setVariable(tn_VARIABLE_FLAGS_06, data.flags06.value | tn_06_FIREPLACE_FLAG_ACTIVATE);
-}
-
-void Titon::setDebug(bool debug) {
-  isDebug = debug;
-  statusChangedCallback();
-}
-
-boolean Titon::isInitOk() {
-  return fullInitDone;
-}
-
-//Callback setters
-void Titon::setPacketCallback(PACKET_CALLBACK_SIGNATURE) {
-  this->packetCallback = packetCallback;
-}
-
-void Titon::setStatusChangedCallback(STATUS_CHANGED_CALLBACK_SIGNATURE) {
-  this->statusChangedCallback = statusChangedCallback;
-}
-
-void Titon::setDebugPrintCallback(DEBUG_PRINT_CALLBACK_SIGNATURE) {
-  this->debugPrintCallback = debugPrintCallback;
-}
-
-void Titon::setTemperatureChangedCallback(TEMPERATURE_CHANGED_CALLBACK_SIGNATURE) {
-  this->temperatureChangedCallback = temperatureChangedCallback;
-}
-
-// Getters
-unsigned long Titon::getUpdated() {
-  return data.updated;
-}
-
-int Titon::getInsideTemp() {
-  return data.t_inside.value;
-}
-
-int Titon::getOutsideTemp() {
-  return data.t_outside.value;
-}
-
-int Titon::getIncomingTemp() {
-  return data.t_incoming.value;
-}
-
-int Titon::getExhaustTemp() {
-  return data.t_exhaust.value;
-}
-
-boolean Titon::isOn() {
-  return data.is_on.value;
-}
-
-boolean Titon::isRhMode() {
-  return data.is_rh_mode.value;
-}
-
-boolean Titon::isHeatingMode() {
-  return data.is_heating_mode.value;
-}
-
-boolean Titon::isSwitchActive() {
-  return data.is_switch_active.value;
-}
-
-boolean Titon::isSummerMode() {
-  return data.is_summer_mode.value;
-}
-
-boolean Titon::isErrorRelay() {
-  return data.is_error.value;
-}
-
-boolean Titon::isMotorIn() {
-  return data.is_in_motor.value;
-}
-
-boolean Titon::isFrontHeating() {
-  return data.is_front_heating.value;
-}
-
-boolean Titon::isMotorOut() {
-  return data.is_out_motor.value;
-}
-
-boolean Titon::isHeating() {
-  return data.is_heating.value;
-}
-
-boolean Titon::isFault() {
-  return data.is_fault.value;
-}
-
-boolean Titon::isServiceNeeded() {
-  return data.is_service.value;
-}
-
-int Titon::getServicePeriod() {
-  return data.service_period.value;
-}
-
-int Titon::getServiceCounter() {
-  return data.service_counter.value;
-}
-
-int Titon::getFanSpeed() {
-  return data.fan_speed.value;
-}
-
-int Titon::getDefaultFanSpeed() {
-  return data.default_fan_speed.value;
-}
-
-int Titon::getRh1() {
-  if (!data.rh1.lastReceived) {
-    return NOT_SET;
-  }
-  return data.rh1.value;
-}
-
-int Titon::getRh2() {
-  if (!data.rh2.lastReceived) {
-    return NOT_SET;
-  }
-  return data.rh2.value;
-}
-
-int Titon::getCO2() {
-  if (!data.co2.lastReceived) {
-    return NOT_SET;
-  }
-  return data.co2.value;
-}
-
-int Titon::getHeatingTarget() {
-  return data.heating_target.value;
-}
-
-int Titon::getSwitchType() {
-  if (!settings.is_boost_setting.lastReceived) {
-    return NOT_SET;
-  }
-  return settings.is_boost_setting.value ? 1 : 0;
-}
-
-// private
-
-// Requests
-void Titon::sendInsideTempReq() {
-  requestVariable(tn_VARIABLE_T_INSIDE);
-}
-
-void Titon::sendOutsideTempReq() {
-  requestVariable(tn_VARIABLE_T_OUTSIDE);
-}
-
-void Titon::sendIncomingTempReq() {
-  requestVariable(tn_VARIABLE_T_INCOMING);
-}
-
-void Titon::sendExhaustTempReq() {
-  requestVariable(tn_VARIABLE_T_EXHAUST);
-}
-
-void Titon::sendStatusReq() {
-  requestVariable(tn_VARIABLE_STATUS);
-}
-
-void Titon::sendServicePeriodReq() {
-  requestVariable(tn_VARIABLE_SERVICE_PERIOD);
-}
-
-void Titon::sendFanSpeedReq() {
-  requestVariable(tn_VARIABLE_FAN_SPEED);
-}
-
-void Titon::sendDefaultFanSpeedReq() {
-  requestVariable(tn_VARIABLE_DEFAULT_FAN_SPEED);
-}
-
-void Titon::sendHeatingTargetReq() {
-  requestVariable(tn_VARIABLE_HEATING_TARGET);
-}
-
-void Titon::sendIO08Req() {
-  requestVariable(tn_VARIABLE_IO_08);
-}
-
-void Titon::sendFlags06Req() {
-  requestVariable(tn_VARIABLE_FLAGS_06);
-}
-
-void Titon::sendProgramReq() {
-  requestVariable(tn_VARIABLE_PROGRAM);
-}
-
-void Titon::sendServiceCounterReq() {
-  requestVariable(tn_VARIABLE_SERVICE_COUNTER);
-}
-
-void Titon::sendRhReq() {
-  requestVariable(tn_VARIABLE_RH1);
-}
-
-// set generic variable value in all mainboards and panels
-void Titon::setVariable(byte variable, byte value) {
-  setVariable(variable, value, tn_MSG_MAINBOARDS);
-}
-
-void Titon::setVariable(byte variable, byte value, byte target) {
-  byte message[tn_MSG_LENGTH];
-  message[0] = tn_MSG_DOMAIN;
-  message[1] = tn_MSG_THIS_PANEL;
-  message[2] = target;
-  message[3] = variable;
-  message[4] = value;
-  message[5] = calculateCheckSum(message);
-
-  // send to all mainboards
-  for (int i = 0; i < tn_MSG_LENGTH; i++) {
-    serial->write(message[i]);
-  }
-
-  if (isDebug && packetCallback) {
-    // Callback that we got the message
-    packetCallback(message, tn_MSG_LENGTH, (char*)"packetSent");
-  }
-
-  message[1] = tn_MSG_MAINBOARD_1;
-  message[2] = tn_MSG_PANELS;
-  message[5] = calculateCheckSum(message);
-
-  // send to all panels
-  for (int i = 0; i < tn_MSG_LENGTH; i++) {
-    serial->write(message[i]);
-  }
-}
-
-void Titon::requestVariable(byte variable) {
-  byte message[tn_MSG_LENGTH];
-  message[0] = tn_MSG_DOMAIN;
-  message[1] = tn_MSG_THIS_PANEL;
-  message[2] = tn_MSG_MAINBOARD_1;
-  message[3] = tn_MSG_POLL_BYTE;
-  message[4] = variable;
-  message[5] = calculateCheckSum(message);
-
-
-  if (isDebug && packetCallback) {
-    // Callback that we got the message
-    packetCallback(message, tn_MSG_LENGTH, (char*)"packetSent");
-  }
-
-  for (int i = 0; i < tn_MSG_LENGTH; i++) {
-    serial->write(message[i]);
-  }
-
-  delay(100);
-}
-
-// tries to read one full message
-// returns true if a message was read, false otherwise
-boolean Titon::readMessage(byte message[]) {
-  boolean ret = false;
-
-  if (serial->available() >= tn_MSG_LENGTH) {
-    message[0] = serial->read();
-
-    if (message[0] == tn_MSG_DOMAIN) {
-      message[1] = serial->read();
-      message[2] = serial->read();
-
-      // accept messages from mainboard 1 or panel 1
-      // accept messages to panel 1, mainboard 1 or to all panels and mainboards
-      if ((message[1] == tn_MSG_MAINBOARD_1 || message[1] == tn_MSG_THIS_PANEL || message[1] == tn_MSG_PANEL_1) &&
-          (message[2] == tn_MSG_PANELS || message[2] == tn_MSG_THIS_PANEL || message[2] == tn_MSG_PANEL_1 ||
-           message[2] == tn_MSG_MAINBOARD_1 || message[2] == tn_MSG_MAINBOARDS)) {
-        int i = 3;
-        // read the rest of the message
-        while (i < tn_MSG_LENGTH) {
-          message[i++] = serial->read();
-        }
-
-        if (isDebug && packetCallback) {
-          // Callback that we got the message
-          packetCallback(message, tn_MSG_LENGTH, (char*)"packetRecv");
-        }
-
-        ret = true;
+  
+  // Read RS485 (always in receive mode unless transmitting)
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    
+    if (c == '\n' || c == '\r') {
+      if (rx_buffer.length() > 0) {
+        parse_response(rx_buffer);
+        rx_buffer = "";
       }
+    } else if (c >= 32 && c <= 126) {
+      rx_buffer += c;
+      if (rx_buffer.length() > 100) rx_buffer = "";
     }
   }
-
-  return ret;
-}
-
-void Titon::decodeMessage(const byte message[]) {
-  // decode variable in message
-  byte variable = message[3];
-  byte value = message[4];
-  unsigned long now = millis();
-
-  // Check message checksum
-  if (!validateCheckSum(message)) {
-    return ;// Message invalid
+  
+  // Read humidity sensor
+  if (millis() - last_humidity_read > HUMIDITY_READ_INTERVAL) {
+    current_humidity = read_humidity();
+    last_humidity_read = millis();
   }
-
-  // Temperature (status object)
-  if (variable == tn_VARIABLE_T_OUTSIDE) { // OUTSIDE
-    checkValueChange(&(data.t_outside.value), ntc2Cel(value), &(data.t_outside.lastReceived));
-  } else if (variable == tn_VARIABLE_T_EXHAUST) { // EXHAUST
-    checkValueChange(&(data.t_exhaust.value), ntc2Cel(value), &(data.t_exhaust.lastReceived));
-  } else if (variable == tn_VARIABLE_T_INSIDE) { // INSIDE
-    checkValueChange(&(data.t_inside.value), ntc2Cel(value), &(data.t_inside.lastReceived));
-  } else if (variable == tn_VARIABLE_T_INCOMING) { // INCOMING
-    checkValueChange(&(data.t_incoming.value), ntc2Cel(value), &(data.t_incoming.lastReceived));
+  
+  // Publish state
+  if (millis() - last_mqtt_publish > PUBLISH_INTERVAL) {
+    publish_state();
+    last_mqtt_publish = millis();
   }
-
-  // RH
-  else if (variable == tn_VARIABLE_RH1) { 
-    checkValueChange(&(data.rh1.value), hex2Rh(value), &(data.rh1.lastReceived));
-  } else if (variable == tn_VARIABLE_RH2) {
-    checkValueChange(&(data.rh2.value), hex2Rh(value), &(data.rh2.lastReceived));
-  }
-
-  // CO2
-  // Let's assume that the timeinterval for the same value is something pre-defined..
-  else if (variable == tn_VARIABLE_CO2_HI) {
-    data.co2_hi.lastReceived = millis();
-    data.co2_hi.value = value;
-    if (data.co2_lo.lastReceived > millis() - CO2_LIFE_TIME_MS) {
-      handleCo2TotalValue(data.co2_hi.value, data.co2_lo.value);
-    }
-  } else if (variable == tn_VARIABLE_CO2_LO) {
-    data.co2_lo.lastReceived = millis();
-    data.co2_lo.value = value;
-    if (data.co2_hi.lastReceived > millis() - CO2_LIFE_TIME_MS) {
-      handleCo2TotalValue(data.co2_hi.value, data.co2_lo.value);
-    }
-  }
-
-  // Others (config object)
-  else if (variable == tn_VARIABLE_FAN_SPEED) {
-    data.fan_speed.lastReceived = millis();
-    checkStatusChange(&(data.fan_speed.value), hex2FanSpeed(value));
-  } else if (variable == tn_VARIABLE_DEFAULT_FAN_SPEED) {
-    data.default_fan_speed.lastReceived = millis();
-    checkStatusChange(&(data.default_fan_speed.value), hex2FanSpeed(value));
-  } else if (variable == tn_VARIABLE_STATUS) {
-    decodeStatus(value);
-  } else if (variable == tn_VARIABLE_IO_08) {
-    decodeVariable08(value);
-  } else if (variable == tn_VARIABLE_FLAGS_06) {
-    decodeFlags06(value);
-  } else if (variable == tn_VARIABLE_SERVICE_PERIOD) {
-    data.service_period.lastReceived = millis();
-    checkStatusChange(&(data.service_period.value), value);
-  } else if (variable == tn_VARIABLE_SERVICE_COUNTER) {
-    data.service_counter.lastReceived = millis();
-    checkStatusChange(&(data.service_counter.value), value);
-  } else if (variable == tn_VARIABLE_HEATING_TARGET) {
-    data.heating_target.lastReceived = millis();
-    checkStatusChange(&(data.heating_target.value), ntc2Cel(value));
-  } else if (variable == tn_VARIABLE_PROGRAM) {
-    decodeProgram(value);
-  } else {
-    // variable not recognized
-  }
-
-  if (!fullInitDone) { // Only send once after all the decoding has been successfully done
-    fullInitDone = isStatusInitDone();
-    if (fullInitDone) {
-      statusChangedCallback(); // Inform only when full init is done to avoid non-set variables being presented
-    }
-  }
-}
-
-// For now, read only (no mutex needed)
-void Titon::decodeVariable08(byte variable08) {
-  // flags of variable 08
-  unsigned long now = millis();
-
-  data.is_summer_mode.lastReceived = now;
-  data.is_error.lastReceived = now;
-  data.is_in_motor.lastReceived = now;
-  data.is_front_heating.lastReceived = now;
-  data.is_out_motor.lastReceived = now;
-  data.is_extra_func.lastReceived = now;
-
-  data.variable08.value = variable08;
-  data.variable08.lastReceived = now;
-
-  checkStatusChange(&(data.is_summer_mode.value), (variable08 & tn_08_FLAG_SUMMER_MODE) != 0x00);
-  checkStatusChange(&(data.is_error.value), (variable08 & tn_08_FLAG_ERROR_RELAY) != 0x00);
-  checkStatusChange(&(data.is_in_motor.value), (variable08 & tn_08_FLAG_MOTOR_IN) != 0x00);
-  checkStatusChange(&(data.is_front_heating.value), (variable08 & tn_08_FLAG_FRONT_HEATING) != 0x00);
-  checkStatusChange(&(data.is_out_motor.value), (variable08 & tn_08_FLAG_MOTOR_OUT) != 0x00);
-  checkStatusChange(&(data.is_extra_func.value), (variable08 & tn_08_FLAG_EXTRA_FUNC) != 0x00);
-}
-
-// For now, read only (no mutex needed)
-void Titon::decodeFlags06(byte flags06) {
-  // flags of variable 06
-  unsigned long now = millis();
-  data.is_switch_active.lastReceived = now;
-
-  data.flags06.value = flags06;
-  data.flags06.lastReceived = now;
-
-  checkStatusChange(&(data.is_switch_active.value), (flags06 & tn_06_FIREPLACE_FLAG_IS_ACTIVE) != 0x00);
-}
-
-void Titon::decodeProgram(byte program) {
-  // flags of programs variable
-  bool shoudInformCallback = !settings.is_boost_setting.lastReceived;
-
-  unsigned long now = millis();
-  settings.is_boost_setting.lastReceived = now;
-
-  settings.program.value = program;
-  settings.program.lastReceived = now;
-
-  checkSettingsChange(&(settings.is_boost_setting.value), (program & tn_PROGRAM_SWITCH_TYPE) != 0x00);
-
-  if (shoudInformCallback) {
-    // Never received, publish
-    statusChangedCallback();
-  }
-}
-
-void Titon::decodeStatus(byte status) {
-  unsigned long now = millis();
-
-  data.is_on.lastReceived = now;
-  data.is_rh_mode.lastReceived = now;
-  data.is_heating_mode.lastReceived = now;
-  data.is_filter.lastReceived = now;
-  data.is_heating.lastReceived = now;
-  data.is_fault.lastReceived = now;
-  data.is_service.lastReceived = now;
-
-  data.status.value = status; // This is the full data status
-  data.status.lastReceived = now;
-
-  checkStatusChange(&(data.is_on.value), (status & tn_STATUS_FLAG_POWER) != 0x00);
-  checkStatusChange(&(data.is_rh_mode.value), (status & tn_STATUS_FLAG_RH) != 0x00);
-  checkStatusChange(&(data.is_heating_mode.value), (status & tn_STATUS_FLAG_HEATING_MODE) != 0x00);
-  checkStatusChange(&(data.is_filter.value), (status & tn_STATUS_FLAG_FILTER) != 0x00);
-  checkStatusChange(&(data.is_heating.value), (status & tn_STATUS_FLAG_HEATING) != 0x00);
-  checkStatusChange(&(data.is_fault.value), (status & tn_STATUS_FLAG_FAULT) != 0x00);
-  checkStatusChange(&(data.is_service.value), (status & tn_STATUS_FLAG_SERVICE) != 0x00);
-
-  statusMutex = false; // Clear the status mutex, allow to continue
-}
-
-//
-// Settings
-void Titon::checkSettingsChange(boolean* oldValue, boolean newValue) {
-  if (checkChange(oldValue, newValue)) {
-    statusChangedCallback();
-  }
-}
-
-//
-// Status
-void Titon::checkStatusChange(boolean* oldValue, boolean newValue) {
-  if (checkChange(oldValue, newValue) && fullInitDone) {
-    statusChangedCallback();
-  }
-}
-
-void Titon::checkStatusChange(int* oldValue, int newValue) {
-  if (checkChange(oldValue, newValue) && fullInitDone) {
-    statusChangedCallback();
-  }
-}
-
-//
-// Temperature change
-void Titon::checkValueChange(int *oldValue, int newValue, unsigned long *lastReceived) {
-  unsigned long now = millis();
-
-  *lastReceived = now;
-  checkValueChange(oldValue, newValue);
-}
-
-// Check for value change (Temperature, CO2, RH)
-void Titon::checkValueChange(int* oldValue, int newValue) {
-  if (checkChange(oldValue, newValue) && isTemperatureInitDone()) { // Do not publish status, until base values has been received
-    temperatureChangedCallback();
-  }
-}
-
-
-int Titon::ntc2Cel(byte ntc) {
-  int i = (int)ntc;
-  return tnTemps[i];
-}
-
-byte Titon::cel2Ntc(int cel) {
-  for (int i = 0; i < 256; i++) {
-    if (tnTemps[i] == cel) {
-      return i;
-    }
-  }
-
-  // we should not be here, return 10 Cel as default
-  return 0x83;
-}
-
-byte Titon::fanSpeed2Hex(int fan) {
-  if (fan > 0 && fan < 9) {
-    return tnFanSpeeds[fan - 1];
-  }
-
-  // we should not be here, return speed 1 as default
-  return tn_FAN_SPEED_1;
-}
-
-int Titon::hex2FanSpeed(byte hex) {
-  for (int i = 0; i < sizeof(tnFanSpeeds); i++) {
-    if (tnFanSpeeds[i] == hex) {
-      return i + 1;
-    }
-  }
-
-  return NOT_SET;
-}
-
-int Titon::hex2Rh(byte hex) {
-  if (hex >= 51) {
-    return (hex - 51) / 2.04;
-  } else {
-    return NOT_SET;
-  }
-}
-
-byte Titon::htCel2Hex(int htCel) {
-  if (htCel < 13) {
-    return 0x01;
-  } else if (htCel < 15) {
-    return 0x03;
-  } else if (htCel < 18) {
-    return 0x07;
-  } else if (htCel < 20) {
-    return 0x0F;
-  } else if (htCel < 23) {
-    return 0x1F;
-  } else if (htCel < 25) {
-    return 0x3F;
-  } else if (htCel < 27) {
-    return 0x7F;
-  } else if (htCel == 27) {
-    return 0xFF;
-  } else {
-    return 0x01;
-  }
-}
-
-// calculate tn message checksum
-byte Titon::calculateCheckSum(const byte message[]) {
-  byte ret = 0x00;
-  for (int i = 0; i < tn_MSG_LENGTH - 1; i++) {
-    ret += message[i];
-  }
-
-  return ret;
-}
-
-bool Titon::validateCheckSum(const byte message[]) {
-  byte calculated = calculateCheckSum(message); // Calculated check sum
-  byte received = message[5];
-
-  if (calculated != received) {
-    debugPrintCallback("Checksum comparison failed!");
-    return false;
-  }
-
-  return true;
-}
-
-
-unsigned long Titon::checkChange(boolean* oldValue, boolean newValue) {
-  unsigned long changed = 0;
-
-  if (*oldValue != newValue) {
-    *oldValue = newValue;
-    data.updated = millis();
-    changed = data.updated;
-  }
-
-  return changed;
-}
-
-unsigned long Titon::checkChange(int* oldValue, int newValue) {
-  unsigned long changed = 0;
-  if (*oldValue != newValue) {
-    *oldValue = newValue;
-    data.updated = millis();
-    changed = data.updated;
-  }
-
-  return changed;
-}
-
-void Titon::retryLoop() {
-  sendMissingRequests();
-  statusMutex = false; // Clear the status mutex (prevents possible deadlocks of status)
-}
-
-void Titon::sendMissingRequests() {
-  if (!data.is_on.lastReceived) sendStatusReq();
-  if (!data.variable08.lastReceived) sendIO08Req();
-  if (!data.fan_speed.lastReceived) sendFanSpeedReq();
-  if (!data.default_fan_speed.lastReceived) sendDefaultFanSpeedReq();
-  if (!data.service_period.lastReceived) sendServicePeriodReq();
-  if (!data.service_counter.lastReceived) sendServiceCounterReq();
-  if (!data.heating_target.lastReceived) sendHeatingTargetReq();
-}
-
-boolean Titon::isTemperatureInitDone() {
-  return data.t_outside.lastReceived &&
-         data.t_inside.lastReceived &&
-         data.t_exhaust.lastReceived &&
-         data.t_incoming.lastReceived;
-}
-
-boolean Titon::isStatusInitDone() { // all initializations
-  // Ensure that all data values has been received
-  return
-    data.is_on.lastReceived &&
-    data.is_rh_mode.lastReceived &&
-    data.is_heating_mode.lastReceived &&
-    data.variable08.lastReceived &&
-    data.is_filter.lastReceived &&
-    data.is_heating.lastReceived &&
-    data.is_fault.lastReceived &&
-    data.is_service.lastReceived &&
-    data.fan_speed.lastReceived &&
-    data.default_fan_speed.lastReceived &&
-    data.service_period.lastReceived &&
-    data.service_counter.lastReceived &&
-    data.heating_target.lastReceived;
-}
-
-void Titon::handleCo2TotalValue(byte hi, byte low) {
-  // Construct co2 value from hi and lo bytes
-  uint16_t total = low + (hi << 8);
-  checkValueChange(&(data.co2.value), total, &(data.co2.lastReceived));
 }
