@@ -1,6 +1,7 @@
 // Titon MVHR - Complete Control with MAX485 Module
 // Board: ESP32 Dev Module (or Lolin32 Lite)
 // RS485: MAX485 module with DE/RE control
+// Version 2.0 - Updated with Ross Cullen's ESPHome discoveries
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -36,19 +37,46 @@ const char* TOPIC_COMMAND = "homeassistant/climate/titon_mvhr/command";
 const char* TOPIC_AVAILABILITY = "homeassistant/climate/titon_mvhr/availability";
 const char* DISCOVERY_PREFIX = "homeassistant";
 
+// ========== STATUS WORD BIT DEFINITIONS ==========
+#define STATUS_SUPPLY_FAN_ERROR     0x0001  // Bit 0
+#define STATUS_THERMISTOR_ERROR     0x0002  // Bit 1 (general)
+#define STATUS_EXTRACT_FAN_ERROR    0x0004  // Bit 2
+#define STATUS_EEPROM_ERROR         0x0008  // Bit 3
+#define STATUS_SWITCH1_ACTIVE       0x0010  // Bit 4
+#define STATUS_SWITCH2_ACTIVE       0x0020  // Bit 5
+#define STATUS_SWITCH3_ACTIVE       0x0040  // Bit 6
+#define STATUS_LS1_ACTIVE           0x0080  // Bit 7
+#define STATUS_LS2_ACTIVE           0x0100  // Bit 8
+#define STATUS_ENGINE_ERROR         0x0200  // Bit 9
+#define STATUS_SWITCH_ERROR         0x0400  // Bit 10
+#define STATUS_ENGINE_RUNNING       0x0800  // Bit 11 (2048 decimal)
+#define STATUS_THERM1_ERROR         0x1000  // Bit 12
+#define STATUS_THERM2_ERROR         0x2000  // Bit 13
+#define STATUS_THERM3_ERROR         0x4000  // Bit 14
+#define STATUS_HUMIDITY_ERROR       0x8000  // Bit 15
+
 // ========== GLOBALS ==========
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
-// Sensor Data
+// Sensor Data - Original
 float supply_temp = NAN;
 float extract_temp = NAN;
 float supply_rpm = NAN;
 float extract_rpm = NAN;
-float current_humidity = NAN;
+float current_humidity = NAN;  // External humidity sensor
 int current_speed = 2;
 bool summer_bypass = false;
 bool summerboost_active = false;
+
+// Sensor Data - NEW from Ross Cullen's discoveries
+float stale_air_in_temp = NAN;   // Address 030 - Thermistor 1
+float stale_air_out_temp = NAN;  // Address 031 - Thermistor 2
+float fresh_air_in_temp = NAN;   // Address 032 - Thermistor 3
+int internal_humidity = -1;      // Address 036 - Internal RH sensor
+int runtime_hours = 0;           // Address 060 - Total runtime
+int status_word = 0;             // Address 061 - Status bitmap
+int filter_remaining = 0;        // Address 341 - Filter hours left
 
 // Relay States (for Home Assistant feedback)
 bool relay_sw1_active = false;
@@ -77,8 +105,11 @@ String rx_buffer = "";
 unsigned long last_mqtt_publish = 0;
 unsigned long last_heartbeat = 0;
 unsigned long last_humidity_read = 0;
+unsigned long last_sensor_poll = 0;
+int poll_index = 0;
 const unsigned long PUBLISH_INTERVAL = 5000;
 const unsigned long HUMIDITY_READ_INTERVAL = 5000;
+const unsigned long SENSOR_POLL_INTERVAL = 2000;  // Poll one sensor every 2 seconds
 
 // ========== FORWARD DECLARATIONS ==========
 void setup_wifi();
@@ -87,6 +118,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length);
 void publish_discovery();
 void publish_state();
 void parse_response(String response);
+void decode_status_word(int status);
 void set_fan_speed(int speed);
 void trigger_boost(int switch_num, unsigned long duration_ms);
 void set_relay(int relay_pin, bool state);
@@ -94,13 +126,15 @@ float read_humidity();
 void rs485_begin_transmit();
 void rs485_begin_receive();
 void send_rs485_command(const char* cmd);
+void poll_mvhr_sensors();
 
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
   Serial.println("\n========================================");
-  Serial.println("Titon MVHR - Complete Control System");
+  Serial.println("Titon MVHR - Complete Control System v2.0");
   Serial.println("With MAX485 Module");
+  Serial.println("Updated with Ross Cullen's discoveries");
   Serial.println("========================================");
   
   // Initialize RS485 with MAX485 control
@@ -128,7 +162,7 @@ void setup() {
   
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
   mqtt.setCallback(mqtt_callback);
-  mqtt.setBufferSize(1024);
+  mqtt.setBufferSize(2048);  // Increased for larger state messages
   
   delay(1000);
   publish_discovery();
@@ -251,6 +285,46 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     trigger_boost(3, 2000);  // SW3 for 2 seconds
   }
   
+  // NEW: Direct RS485 control commands
+  if (doc.containsKey("boost_inhibit")) {
+    bool enabled = doc["boost_inhibit"];
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "3260+%05d\r\n", enabled ? 1 : 0);
+    send_rs485_command(cmd);
+    Serial.printf("Boost Inhibit (Night Mode): %s\n", enabled ? "ENABLED" : "DISABLED");
+  }
+  
+  if (doc.containsKey("summer_bypass_enable")) {
+    bool enabled = doc["summer_bypass_enable"];
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "2300+%05d\r\n", enabled ? 1 : 0);
+    send_rs485_command(cmd);
+    Serial.printf("Summer Bypass: %s\n", enabled ? "ENABLED" : "DISABLED");
+  }
+  
+  // CRITICAL FIX: SUMMERboost uses INVERTED logic!
+  if (doc.containsKey("summerboost_enable")) {
+    bool enabled = doc["summerboost_enable"];
+    char cmd[16];
+    snprintf(cmd, sizeof(cmd), "2900+%05d\r\n", enabled ? 0 : 1);  // INVERTED!
+    send_rs485_command(cmd);
+    Serial.printf("SUMMERboost: %s (wrote %d - inverted logic)\n", 
+                  enabled ? "ENABLED" : "DISABLED", 
+                  enabled ? 0 : 1);
+  }
+  
+  // Factory reset with safety confirmation
+  if (doc.containsKey("factory_reset")) {
+    bool confirm = doc["factory_reset"];
+    if (confirm) {
+      Serial.println("⚠️⚠️⚠️  FACTORY RESET REQUESTED!");
+      Serial.println("Sending reset command in 5 seconds...");
+      delay(5000);
+      send_rs485_command("0680+21930\r\n");
+      Serial.println("Factory reset command sent!");
+    }
+  }
+  
   // Settings updates (stored in memory)
   if (doc.containsKey("speed1_supply")) settings.speed1_supply = doc["speed1_supply"];
   if (doc.containsKey("speed1_extract")) settings.speed1_extract = doc["speed1_extract"];
@@ -304,6 +378,7 @@ void publish_discovery() {
     dev["name"] = "Titon MVHR";
     dev["model"] = "HRV1.6 Q Plus HMB";
     dev["manufacturer"] = "Titon";
+    dev["sw_version"] = "v2.0";
     
     char buffer[768];
     serializeJson(doc, buffer);
@@ -331,15 +406,27 @@ void publish_discovery() {
     delay(50); \
   }
   
+  // Original sensors
   PUBLISH_SENSOR("supply_temp", "Supply Temperature", "°C", "temperature");
   PUBLISH_SENSOR("extract_temp", "Extract Temperature", "°C", "temperature");
   PUBLISH_SENSOR("supply_rpm", "Supply Fan RPM", "RPM", "");
   PUBLISH_SENSOR("extract_rpm", "Extract Fan RPM", "RPM", "");
   PUBLISH_SENSOR("current_speed", "Current Speed", "", "");
-  PUBLISH_SENSOR("humidity", "Current Humidity", "%", "humidity");
+  PUBLISH_SENSOR("humidity", "External Humidity", "%", "humidity");
   
-  // Binary sensors
-  #define PUBLISH_BINARY(id, name) { \
+  // NEW: Three thermistors from Ross's discoveries
+  PUBLISH_SENSOR("stale_air_in_temp", "Stale Air In Temperature", "°C", "temperature");
+  PUBLISH_SENSOR("stale_air_out_temp", "Stale Air Out Temperature", "°C", "temperature");
+  PUBLISH_SENSOR("fresh_air_in_temp", "Fresh Air In Temperature", "°C", "temperature");
+  
+  // NEW: Additional sensors
+  PUBLISH_SENSOR("internal_humidity", "Internal Humidity", "%", "humidity");
+  PUBLISH_SENSOR("runtime_hours", "Runtime Hours", "h", "duration");
+  PUBLISH_SENSOR("filter_remaining", "Filter Remaining", "h", "duration");
+  PUBLISH_SENSOR("status_word", "Status Word (Raw)", "", "");
+  
+  // Binary sensors macro
+  #define PUBLISH_BINARY(id, name, dev_class) { \
     char topic[128]; \
     snprintf(topic, sizeof(topic), "%s/binary_sensor/titon_mvhr/%s/config", DISCOVERY_PREFIX, id); \
     StaticJsonDocument<384> doc; \
@@ -350,6 +437,7 @@ void publish_discovery() {
     doc["payload_on"] = "true"; \
     doc["payload_off"] = "false"; \
     doc["availability_topic"] = TOPIC_AVAILABILITY; \
+    if (strlen(dev_class) > 0) doc["device_class"] = dev_class; \
     JsonObject dev = doc.createNestedObject("device"); \
     dev["identifiers"][0] = "titon_mvhr"; \
     char buffer[384]; \
@@ -358,8 +446,22 @@ void publish_discovery() {
     delay(50); \
   }
   
-  PUBLISH_BINARY("summer_bypass", "Summer Bypass Active");
-  PUBLISH_BINARY("summerboost", "SUMMERboost Active");
+  // Original binary sensors
+  PUBLISH_BINARY("summer_bypass", "Summer Bypass Active", "");
+  PUBLISH_BINARY("summerboost", "SUMMERboost Active", "");
+  
+  // NEW: Status word decoded sensors
+  PUBLISH_BINARY("engine_running", "Engine Running", "running");
+  PUBLISH_BINARY("supply_fan_error", "Supply Fan Error", "problem");
+  PUBLISH_BINARY("extract_fan_error", "Extract Fan Error", "problem");
+  PUBLISH_BINARY("thermistor_error", "Thermistor Error (General)", "problem");
+  PUBLISH_BINARY("therm1_error", "Thermistor 1 Error", "problem");
+  PUBLISH_BINARY("therm2_error", "Thermistor 2 Error", "problem");
+  PUBLISH_BINARY("therm3_error", "Thermistor 3 Error", "problem");
+  PUBLISH_BINARY("humidity_sensor_error", "Humidity Sensor Error", "problem");
+  PUBLISH_BINARY("eeprom_error", "EEPROM Error", "problem");
+  PUBLISH_BINARY("engine_error", "Engine Error", "problem");
+  PUBLISH_BINARY("switch_error", "Switch Error", "problem");
   
   // Switch entities
   #define PUBLISH_SWITCH(id, name) { \
@@ -388,6 +490,11 @@ void publish_discovery() {
   PUBLISH_SWITCH("sw2", "Wet Room Boost (SW2)");
   PUBLISH_SWITCH("sw3", "Setback/Kitchen (SW3)");
   
+  // NEW: Direct RS485 control switches
+  PUBLISH_SWITCH("boost_inhibit", "Boost Inhibit (Night Mode)");
+  PUBLISH_SWITCH("summer_bypass_enable", "Summer Bypass Enable");
+  PUBLISH_SWITCH("summerboost_enable", "SUMMERboost Enable");
+  
   // Button entities
   #define PUBLISH_BUTTON(id, name, cmd_key) { \
     char topic[128]; \
@@ -408,6 +515,7 @@ void publish_discovery() {
   
   PUBLISH_BUTTON("trigger_wetroom", "Trigger Wet Room Boost", "trigger_wetroom_boost");
   PUBLISH_BUTTON("trigger_kitchen", "Trigger Kitchen Boost", "trigger_kitchen_boost");
+  PUBLISH_BUTTON("factory_reset_btn", "Factory Reset MVHR", "factory_reset");
   
   // Number entities
   #define PUBLISH_NUMBER(id, name, min_v, max_v) { \
@@ -454,15 +562,45 @@ void publish_discovery() {
 void publish_state() {
   if (!mqtt.connected()) return;
   
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;  // Increased for all new sensors
   
-  // Sensor data
+  // Original temperature sensors
   doc["supply_temp"] = supply_temp;
   doc["extract_temp"] = extract_temp;
+  
+  // NEW: Three thermistors
+  doc["stale_air_in_temp"] = stale_air_in_temp;
+  doc["stale_air_out_temp"] = stale_air_out_temp;
+  doc["fresh_air_in_temp"] = fresh_air_in_temp;
+  
+  // RPM and speed
   doc["supply_rpm"] = supply_rpm;
   doc["extract_rpm"] = extract_rpm;
   doc["current_speed"] = current_speed;
-  doc["humidity"] = current_humidity;
+  
+  // Humidity sensors
+  doc["humidity"] = current_humidity;          // External sensor
+  doc["internal_humidity"] = internal_humidity; // NEW: Internal sensor
+  
+  // NEW: Runtime and filter
+  doc["runtime_hours"] = runtime_hours;
+  doc["filter_remaining"] = filter_remaining;
+  doc["status_word"] = status_word;
+  
+  // Status flags (decoded from status word)
+  doc["engine_running"] = (status_word & STATUS_ENGINE_RUNNING) != 0;
+  doc["supply_fan_error"] = (status_word & STATUS_SUPPLY_FAN_ERROR) != 0;
+  doc["extract_fan_error"] = (status_word & STATUS_EXTRACT_FAN_ERROR) != 0;
+  doc["thermistor_error"] = (status_word & STATUS_THERMISTOR_ERROR) != 0;
+  doc["therm1_error"] = (status_word & STATUS_THERM1_ERROR) != 0;
+  doc["therm2_error"] = (status_word & STATUS_THERM2_ERROR) != 0;
+  doc["therm3_error"] = (status_word & STATUS_THERM3_ERROR) != 0;
+  doc["humidity_sensor_error"] = (status_word & STATUS_HUMIDITY_ERROR) != 0;
+  doc["eeprom_error"] = (status_word & STATUS_EEPROM_ERROR) != 0;
+  doc["engine_error"] = (status_word & STATUS_ENGINE_ERROR) != 0;
+  doc["switch_error"] = (status_word & STATUS_SWITCH_ERROR) != 0;
+  
+  // System state
   doc["summer_bypass"] = summer_bypass;
   doc["summerboost"] = summerboost_active;
   
@@ -495,7 +633,7 @@ void publish_state() {
   doc["bypass_supply_threshold"] = settings.bypass_supply_threshold;
   doc["summerboost_enabled"] = settings.summerboost_enabled;
   
-  char buffer[1024];
+  char buffer[2048];
   serializeJson(doc, buffer);
   mqtt.publish(TOPIC_STATE, buffer);
 }
@@ -515,7 +653,52 @@ void parse_response(String response) {
   int address = response.substring(0, sign_pos).toInt();
   int value = response.substring(sign_pos).toInt();
   
+  // Check for error response (faulty sensor returns -99999)
+  if (value == -99999) {
+    Serial.printf("⚠️  Address %d returned error (-99999) - FAULTY SENSOR!\n", address);
+    return;  // Don't update the value
+  }
+  
   switch (address) {
+    // NEW: Three thermistors (0.1°C resolution)
+    case 30:
+      stale_air_in_temp = value / 10.0;
+      Serial.printf("Stale In Temp: %.1f°C\n", stale_air_in_temp);
+      break;
+    case 31:
+      stale_air_out_temp = value / 10.0;
+      Serial.printf("Stale Out Temp: %.1f°C\n", stale_air_out_temp);
+      break;
+    case 32:
+      fresh_air_in_temp = value / 10.0;
+      Serial.printf("Fresh In Temp: %.1f°C\n", fresh_air_in_temp);
+      break;
+      
+    // NEW: Internal humidity (1% resolution)
+    case 36:
+      internal_humidity = value;
+      Serial.printf("Internal Humidity: %d%%\n", internal_humidity);
+      break;
+      
+    // NEW: Runtime hours
+    case 60:
+      runtime_hours = value;
+      Serial.printf("Runtime Hours: %d\n", runtime_hours);
+      break;
+      
+    // NEW: Status word (decode bits)
+    case 61:
+      status_word = value;
+      decode_status_word(value);
+      break;
+      
+    // NEW: Filter remaining
+    case 341:
+      filter_remaining = value;
+      Serial.printf("Filter Remaining: %d hours\n", filter_remaining);
+      break;
+      
+    // Original sensors
     case 380:
       supply_rpm = value;
       break;
@@ -538,6 +721,54 @@ void parse_response(String response) {
   }
 }
 
+// ========== NEW: STATUS WORD DECODER ==========
+void decode_status_word(int status) {
+  Serial.println("=== STATUS WORD DECODING ===");
+  Serial.printf("Raw value: %d (0x%04X)\n", status, status);
+  
+  if (status & STATUS_SUPPLY_FAN_ERROR)    Serial.println("⚠️  Supply Fan Error");
+  if (status & STATUS_THERMISTOR_ERROR)    Serial.println("⚠️  Thermistor Error (General)");
+  if (status & STATUS_EXTRACT_FAN_ERROR)   Serial.println("⚠️  Extract Fan Error");
+  if (status & STATUS_EEPROM_ERROR)        Serial.println("⚠️  EEPROM Error");
+  if (status & STATUS_SWITCH1_ACTIVE)      Serial.println("ℹ️  Switch 1 Active");
+  if (status & STATUS_SWITCH2_ACTIVE)      Serial.println("ℹ️  Switch 2 Active");
+  if (status & STATUS_SWITCH3_ACTIVE)      Serial.println("ℹ️  Switch 3 Active");
+  if (status & STATUS_LS1_ACTIVE)          Serial.println("ℹ️  LS1 Active");
+  if (status & STATUS_LS2_ACTIVE)          Serial.println("ℹ️  LS2 Active");
+  if (status & STATUS_ENGINE_ERROR)        Serial.println("⚠️  Engine Error");
+  if (status & STATUS_SWITCH_ERROR)        Serial.println("⚠️  Switch Error");
+  if (status & STATUS_ENGINE_RUNNING)      Serial.println("✅ Engine Running");
+  if (status & STATUS_THERM1_ERROR)        Serial.println("⚠️  Thermistor 1 Error");
+  if (status & STATUS_THERM2_ERROR)        Serial.println("⚠️  Thermistor 2 Error");
+  if (status & STATUS_THERM3_ERROR)        Serial.println("⚠️  Thermistor 3 Error");
+  if (status & STATUS_HUMIDITY_ERROR)      Serial.println("⚠️  Humidity Sensor Error");
+  
+  Serial.println("===========================");
+}
+
+// ========== NEW: ROTATING SENSOR POLL ==========
+void poll_mvhr_sensors() {
+  if (millis() - last_sensor_poll < SENSOR_POLL_INTERVAL) return;
+  last_sensor_poll = millis();
+  
+  // Rotate through sensors to avoid bus saturation
+  // Poll one sensor every 2 seconds = all 10 sensors every 20 seconds
+  switch (poll_index) {
+    case 0: send_rs485_command("0301+00000\r\n"); break;  // Stale In
+    case 1: send_rs485_command("0311+00000\r\n"); break;  // Stale Out
+    case 2: send_rs485_command("0321+00000\r\n"); break;  // Fresh In
+    case 3: send_rs485_command("0361+00000\r\n"); break;  // Internal Humidity
+    case 4: send_rs485_command("0601+00000\r\n"); break;  // Runtime Hours
+    case 5: send_rs485_command("0611+00000\r\n"); break;  // Status Word
+    case 6: send_rs485_command("3411+00000\r\n"); break;  // Filter Remaining
+    case 7: send_rs485_command("3821+00000\r\n"); break;  // Supply Temp
+    case 8: send_rs485_command("3831+00000\r\n"); break;  // Extract Temp
+    case 9: send_rs485_command("3841+00000\r\n"); break;  // Current Speed
+  }
+  
+  poll_index = (poll_index + 1) % 10;
+}
+
 // ========== FAN SPEED CONTROL (RS485) ==========
 void set_fan_speed(int speed) {
   if (speed < 1 || speed > 4) return;
@@ -553,7 +784,7 @@ void set_fan_speed(int speed) {
   char cmd[16];
   snprintf(cmd, sizeof(cmd), "3840+%05d\r\n", speed_value);
   send_rs485_command(cmd);
-  Serial.printf("Set speed to %d\n", speed);
+  Serial.printf("Set speed to %d (value=%d)\n", speed, speed_value);
 }
 
 // ========== RELAY CONTROL ==========
@@ -619,13 +850,19 @@ void loop() {
   mqtt.loop();
   
   // Heartbeat
-  if (millis() - last_heartbeat > 2000) {
-    Serial.printf("Status - WiFi:%s MQTT:%s Humidity:%.1f%%\n",
+  if (millis() - last_heartbeat > 5000) {
+    Serial.printf("Status - WiFi:%s MQTT:%s ExtRH:%.1f%% IntRH:%d%% Runtime:%dh Filter:%dh\n",
                   WiFi.status() == WL_CONNECTED ? "OK" : "X",
                   mqtt.connected() ? "OK" : "X",
-                  current_humidity);
+                  current_humidity,
+                  internal_humidity,
+                  runtime_hours,
+                  filter_remaining);
     last_heartbeat = millis();
   }
+  
+  // NEW: Rotating sensor poll (one sensor every 2 seconds)
+  poll_mvhr_sensors();
   
   // Read RS485 (always in receive mode unless transmitting)
   while (Serial2.available()) {
@@ -633,6 +870,7 @@ void loop() {
     
     if (c == '\n' || c == '\r') {
       if (rx_buffer.length() > 0) {
+        Serial.printf("RS485 RX: %s\n", rx_buffer.c_str());
         parse_response(rx_buffer);
         rx_buffer = "";
       }
@@ -642,7 +880,7 @@ void loop() {
     }
   }
   
-  // Read humidity sensor
+  // Read external humidity sensor
   if (millis() - last_humidity_read > HUMIDITY_READ_INTERVAL) {
     current_humidity = read_humidity();
     last_humidity_read = millis();
