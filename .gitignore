@@ -1,0 +1,6 @@
+secrets.h
+!test/stubs/secrets.h
+.pio/
+*.o
+*.out
+a.out
