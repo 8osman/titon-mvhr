@@ -39,8 +39,10 @@ protocol is a related but different version: registers 326 and 290 match, 036 (h
 Status 384 bits: 0-3 speed 1-4, 5 switch closed, 6 humidity control active, 8 boost inhibit, 9 overrun, 12 bypass, 15 SUMMERboost, 11/13/14 faults.
 
 ## Hardware
-ESP32 4-relay board (relay GPIO 32/33/25/26, LED 23) plus a 3.3 V RS-485 transceiver: RO to GPIO16, DI to GPIO17, DE and /RE tied together to GPIO27 with a 10k pull-down. Pins and limits are in `config.h`.
+ESP32 4-relay board (relay GPIO 32/33/25/26, LED 23) plus a 3.3 V RS-485 transceiver (MAX3485 Module TTL to RS485): 
+RO to GPIO16, DI to GPIO17, DE and /RE tied together to GPIO27 with a 10k pull-down. Pins and limits are in `config.h`.
 Relay 4 should switch only the Aura-T supply through NC/COM so every failure leaves it powered.
+Fasizi ESP32 4-Channel Relay Module with WiFi/Bluetooth IoT Development Board AC220V/DC5-30V ESP32-WROOM-32E
 
 ## Build and flash
 1. Install Arduino or PlatformIO with the ESP32 core and the **PubSubClient** library. Board: ESP32 Dev Module.
